@@ -1,0 +1,9 @@
+{
+    "name": "qwen-asr-client",
+    "version": "1.0.0",
+    "description": "Streaming client for Qwen-ASR",
+    "type": "module",
+    "dependencies": {
+        "ws": "^8.16.0"
+    }
+}
