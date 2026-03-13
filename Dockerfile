@@ -1,6 +1,6 @@
 # Dockerfile of qwenllm/qwen3-asr:cu128
 
-ARG CUDA_VERSION=12.8.0
+ARG CUDA_VERSION=12.1.0
 ARG from=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
 FROM ${from} AS base
 
@@ -40,7 +40,7 @@ ENV MAX_JOBS=32
 ENV NVCC_THREADS=2
 ENV CCACHE_DIR=/root/.cache/ccache
 
-ARG BUNDLE_FLASH_ATTENTION=true
+# ARG BUNDLE_FLASH_ATTENTION=true
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install -U pip setuptools wheel
@@ -52,10 +52,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install -U "qwen-asr[vllm]" fastapi uvicorn python-multipart requests soundfile scipy websockets
 
 RUN --mount=type=cache,target=/root/.cache/ccache \
-    --mount=type=cache,target=/root/.cache/pip \
-    if [ "$BUNDLE_FLASH_ATTENTION" = "true" ]; then \
-        pip3 install -U flash-attn --no-build-isolation git+https://github.com/Dao-AILab/flash-attention.git; \
-    fi
+    --mount=type=cache,target=/root/.cache/pip
+    # if [ "$BUNDLE_FLASH_ATTENTION" = "true" ]; then \
+    #     pip3 install -U flash-attn --no-build-isolation git+https://github.com/Dao-AILab/flash-attention.git; \
+    # fi
 
 RUN rm -rf /root/.cache/pip
 

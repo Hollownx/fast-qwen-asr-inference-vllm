@@ -1,0 +1,324 @@
+# =====================================================
+# Makefile.tensorrt — Qwen3-ASR TensorRT 版（不依赖 vLLM）  模型缓存一并带过去   	  --restart=always \
+# =====================================================
+# 用法:
+#   make -f Makefile.tensorrt build                      构建 Docker 镜像
+#   make -f Makefile.tensorrt up                         启动服务（llm 后端，纯 transformers）
+#   make -f Makefile.tensorrt up BACKEND=torch_compile   启动服务（inductor 内核融合加速）  #实际无差别 
+#   make -f Makefile.tensorrt up BACKEND=torch_compile_trt  启动服务（torch_compile + TensorRT JIT） #tensorrt（版本本机PyTorch冲突）
+#   make -f Makefile.tensorrt run-local                  本地直接运行（不用 Docker）
+#   make -f Makefile.tensorrt run-local BACKEND=torch_compile_trt   本地 TRT JIT 运行
+#   make -f Makefile.tensorrt down                       停止并删除容器
+#   make -f Makefile.tensorrt logs                       查看日志
+#   make -f Makefile.tensorrt health                     健康检查
+#   make -f Makefile.tensorrt test                       自动下载样本 + 批量测试
+#   make -f Makefile.tensorrt test-streaming             流式测试
+#   make -f Makefile.tensorrt test-batch                 批量测试
+#   make -f Makefile.tensorrt test-transcribe-ue         通过 /transcribe-ue 模拟 UE HTTP 调用  docker调用无用
+#   make -f Makefile.tensorrt benchmark-streaming        流式压测
+#   make -f Makefile.tensorrt benchmark-batch            批量压测
+#
+# torch_compile_trt 注意事项:
+#   需安装 torch-tensorrt（版本需与 PyTorch 完全匹配）:
+#     pip install torch-tensorrt
+#   首次推理会触发 TRT JIT 编译（约 1-5 分钟），之后极快
+#   编译缓存保存在 ~/.cache/torch_tensorrt/，重启后无需重新编译
+# =====================================================
+
+# -----------------------------
+# 镜像 & 容器
+# -----------------------------
+IMAGE              ?= qwen3-asr-trt:latest
+CONTAINER          ?= qwen3-asr-trt
+PORT               ?= 8908
+
+# -----------------------------
+# 模型配置
+# -----------------------------
+ASR_MODEL_NAME     ?= Qwen/Qwen3-ASR-1.7B
+HF_HOME            ?= $(PWD)/hf_models
+
+#HF_HOME            ?= /home/ld01/.cache/huggingface/hub
+#C:\Users\你的用户名\.cache\huggingface\hub
+#/mnt/c/Users/你的用户名./cache/huggingface/hub
+#/root/.cache/huggingface/hub
+
+# -----------------------------
+# 后端选择:
+#   llm              — 纯 transformers eager 推理（默认，最省显存 ~3.5GB）
+#   torch_compile    — + torch.compile(inductor)，内核融合加速
+#   torch_compile_trt — + torch.compile(backend="tensorrt")，需 torch-tensorrt
+#   tensorrt         — 已构建的 .engine 文件（目前模型不支持 ONNX 导出）
+# -----------------------------
+BACKEND            ?= llm
+ENGINE_FILE        ?= qwen3_asr_1.7b.engine
+ONNX_FILE          ?= qwen3_asr_1.7b.onnx
+ONNX_SIM_FILE      ?= qwen3_asr_1.7b_sim.onnx
+WORKSPACE_GB       ?= 4
+
+# -----------------------------
+# 测试 & 基准
+# -----------------------------
+FILES_DIR          ?= files
+BENCH_CLIENTS      ?= 4
+BENCH_REQUESTS     ?= 20
+
+# -----------------------------
+# Targets
+# -----------------------------
+.PHONY: build up down logs health \
+        test test-streaming test-batch test-transcribe-ue \
+        setup-local run-local \
+        export-onnx simplify-onnx build-engine build-engine-int8 \
+        benchmark-streaming benchmark-batch \
+        shell
+
+# =====================================================
+# Docker 镜像构建
+# =====================================================
+build:
+	@echo "=========================================="
+	@echo "  构建 TensorRT 镜像: $(IMAGE)"
+	@echo "=========================================="
+	docker build --rm -f Dockerfile.tensorrt -t $(IMAGE) .
+
+# =====================================================
+# 容器启动 / 停止 / 日志
+# =====================================================
+up:
+	@echo "=========================================="
+	@echo "  启动 Qwen3-ASR TensorRT 服务"
+	@echo "=========================================="
+	@echo "  镜像:       $(IMAGE)"
+	@echo "  容器名:     $(CONTAINER)"
+	@echo "  端口:       $(PORT) → 8001"
+	@echo "  后端:       $(BACKEND)  (llm | torch_compile | torch_compile_trt | tensorrt)"
+	@echo "  模型:       $(ASR_MODEL_NAME)"
+	@echo "  引擎文件:   $(ENGINE_FILE)"
+	@echo "  HF缓存:     $(HF_HOME)"
+	@echo "=========================================="
+	@read -p "确认启动? [y/N] " ans && [ $${ans:-N} = y ] || (echo "已取消." && exit 1)
+	mkdir -p $(FILES_DIR)
+	-docker rm -f $(CONTAINER) 2>/dev/null
+	docker run -d --name $(CONTAINER) \
+	  --restart=always \
+	  --gpus all --ipc=host \
+	  -p $(PORT):8001 \
+	  -e ASR_BACKEND=$(BACKEND) \
+	  -e ASR_MODEL_NAME=$(ASR_MODEL_NAME) \
+	  -e ASR_TENSORRT_ENGINE=/data/shared/Qwen3-ASR/$(ENGINE_FILE) \
+	  -e HF_HOME="/data/shared/hf_models" \
+	  -e LISTEN_PORT=8001 \
+	  -e HF_HUB_OFFLINE=1 \
+	  -e TRANSFORMERS_OFFLINE=1 \
+	  -e HF_DATASETS_OFFLINE=1 \
+	  -v $(PWD):/data/shared/Qwen3-ASR \
+	  -v $(HF_HOME):/data/shared/hf_models \
+	  $(IMAGE)
+	@echo ""
+	@echo "容器已启动，正在跟踪日志 (Ctrl+C 退出日志)..."
+	@$(MAKE) -f Makefile.tensorrt logs
+
+down:
+	@echo "停止并删除容器: $(CONTAINER)"
+	-docker rm -f $(CONTAINER)
+
+logs:
+	docker logs -f $(CONTAINER)
+
+shell:
+	docker exec -it $(CONTAINER) bash
+
+# =====================================================
+# 健康检查
+# =====================================================
+health:
+	@echo "检查服务状态..."
+	@curl -sf http://localhost:$(PORT)/health | jq . || echo "服务未响应，请检查容器是否启动"
+
+# =====================================================
+# 本地运行（不用 Docker）
+# =====================================================
+setup-local:
+	@echo "初始化本地 Python 环境（安装基础依赖）..."
+	pip install qwen-asr fastapi uvicorn python-multipart soundfile scipy numpy psutil websockets
+	@echo "如需 torch_compile_trt 后端，另执行: pip install torch-tensorrt"
+	@echo "本地环境就绪"
+
+run-local:
+	@echo "本地启动 ($(BACKEND) 后端, 端口 $(PORT))..."
+	@if [ "$(BACKEND)" = "torch_compile_trt" ]; then \
+		python -c "import torch_tensorrt" 2>/dev/null || \
+		(echo "错误: 未找到 torch-tensorrt，请先执行: pip install torch-tensorrt" && exit 1); \
+	fi
+	ASR_BACKEND=$(BACKEND) \
+	ASR_MODEL_NAME=$(ASR_MODEL_NAME) \
+	ASR_TENSORRT_ENGINE=$(ENGINE_FILE) \
+	LISTEN_PORT=$(PORT) \
+	python server_tensorrt.py
+
+# =====================================================
+# ONNX 导出 & TensorRT 引擎构建
+# 注意: Qwen3-ASR 音频塔含大量动态 Python 控制流，无法静态导出 ONNX。
+#       建议使用 torch.compile(backend="tensorrt") 或 vLLM TRT-LLM 后端。
+#       运行 `make -f Makefile.tensorrt export-onnx` 将打印详细说明。
+# =====================================================
+export-onnx:
+	@echo "=== Qwen3-ASR ONNX 导出不可行 ==="
+	@python scripts/export_onnx.py; exit 1
+
+simplify-onnx:
+	@echo "简化 ONNX: $(ONNX_FILE) → $(ONNX_SIM_FILE)"
+	@pip install -q onnxsim 2>/dev/null || true
+	onnxsim $(ONNX_FILE) $(ONNX_SIM_FILE)
+	@echo "完成: $(ONNX_SIM_FILE)"
+
+build-engine:
+	@echo "构建 TensorRT FP16 引擎: $(ONNX_SIM_FILE) → $(ENGINE_FILE)"
+	@if [ ! -f "$(ONNX_SIM_FILE)" ]; then \
+		echo "错误: $(ONNX_SIM_FILE) 不存在，请先运行: make -f Makefile.tensorrt export-onnx simplify-onnx"; \
+		exit 1; \
+	fi
+	python scripts/build_engine.py \
+		--onnx $(ONNX_SIM_FILE) \
+		--engine $(ENGINE_FILE) \
+		--workspace_gb $(WORKSPACE_GB)
+
+build-engine-int8:
+	@echo "构建 TensorRT INT8 引擎: $(ONNX_SIM_FILE) → $(ENGINE_FILE)"
+	@if [ ! -f "$(ONNX_SIM_FILE)" ]; then \
+		echo "错误: $(ONNX_SIM_FILE) 不存在，请先运行: make -f Makefile.tensorrt export-onnx simplify-onnx"; \
+		exit 1; \
+	fi
+	python scripts/build_engine.py \
+		--onnx $(ONNX_SIM_FILE) \
+		--engine $(ENGINE_FILE) \
+		--workspace_gb $(WORKSPACE_GB) \
+		--int8
+
+# =====================================================
+# 测试
+# =====================================================
+test: _download-samples test-batch
+	@echo "测试完成"
+
+_download-samples:
+	@mkdir -p $(FILES_DIR)
+	@for ext in m4a mp3 wav; do \
+		if [ ! -f "$(FILES_DIR)/reference.$$ext" ]; then \
+			echo "下载 reference.$$ext..."; \
+			wget -q -O $(FILES_DIR)/reference.$$ext \
+				https://raw.githubusercontent.com/kyr0/asr-sample-files/refs/heads/main/reference.$$ext; \
+		fi \
+	done
+
+test-batch:
+	@echo "=========================================="
+	@echo "  批量转录测试 (端口 $(PORT))"
+	@echo "=========================================="
+	@pass=0; fail=0; \
+	for ext in m4a mp3 wav; do \
+		file="$(FILES_DIR)/reference.$$ext"; \
+		if [ ! -f "$$file" ]; then echo "跳过: $$file 不存在"; continue; fi; \
+		echo "测试: $$file"; \
+		resp=$$(curl -s -X POST -F "files=@$$file" "http://localhost:$(PORT)/transcribe?language=de"); \
+		echo "  响应: $$resp"; \
+		if echo "$$resp" | grep -iq "referenz"; then \
+			echo "  ✓ 通过"; \
+			pass=$$((pass+1)); \
+		else \
+			echo "  ✗ 失败"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo ""; \
+	echo "结果: $$pass 通过, $$fail 失败"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi
+
+test-streaming:
+	@echo "=========================================="
+	@echo "  流式转录测试 (端口 $(PORT))"
+	@echo "=========================================="
+	@if [ ! -f "$(FILES_DIR)/reference.pcm" ]; then \
+		echo "错误: $(FILES_DIR)/reference.pcm 不存在"; \
+		echo "  请准备 16kHz 16-bit mono PCM 文件"; \
+		exit 1; \
+	fi
+	python client-streaming.py \
+		-e ws://127.0.0.1:$(PORT)/transcribe-streaming \
+		-f $(FILES_DIR)/reference.pcm
+
+test-transcribe-ue: _download-samples
+	@echo "=========================================="
+	@echo "  UE HTTP /transcribe-ue 测试 (端口 $(PORT))"
+	@echo "=========================================="
+	@file="$(FILES_DIR)/reference.wav"; \
+	if [ ! -f "$$file" ]; then \
+		echo "错误: $$file 不存在，请先运行 make -f Makefile.tensorrt _download-samples"; \
+		exit 1; \
+	fi; \
+	echo "使用 $$file 作为请求体 (Content-Type: application/octet-stream)"; \
+	curl -s -X POST \
+	  -H "Content-Type: application/octet-stream" \
+	  --data-binary "@$$file" \
+	  "http://127.0.0.1:$(PORT)/transcribe-ue" | jq .
+
+test-multi-batch:
+	@echo "多文件批量测试..."
+	@curl -s -X POST "http://127.0.0.1:$(PORT)/transcribe?language=de" \
+		-F "files=@$(FILES_DIR)/reference.m4a" \
+		-F "files=@$(FILES_DIR)/reference.mp3" \
+		-F "files=@$(FILES_DIR)/reference.wav" | jq .
+
+# =====================================================
+# 压力测试
+# =====================================================
+benchmark-streaming:
+	@echo "流式压测 (并发=$(BENCH_CLIENTS), 请求=$(BENCH_REQUESTS))..."
+	python benchmark.py \
+		--mode streaming \
+		--url ws://127.0.0.1:$(PORT)/transcribe-streaming \
+		--file $(FILES_DIR)/reference.pcm \
+		--clients $(BENCH_CLIENTS) \
+		--requests $(BENCH_REQUESTS)
+
+benchmark-batch:
+	@echo "批量压测 (并发=$(BENCH_CLIENTS), 请求=$(BENCH_REQUESTS))..."
+	python benchmark.py \
+		--mode batch \
+		--url http://127.0.0.1:$(PORT)/transcribe \
+		--file $(FILES_DIR)/reference.wav \
+		--clients $(BENCH_CLIENTS) \
+		--requests $(BENCH_REQUESTS)
+
+# =====================================================
+# 完整流水线：从零到部署
+# =====================================================
+# 用法:
+#   make -f Makefile.tensorrt pipeline-pytorch   # PyTorch 后端全流程
+#   make -f Makefile.tensorrt pipeline-tensorrt   # TensorRT 后端全流程
+pipeline-pytorch: build
+	@echo "=========================================="
+	@echo "  PyTorch 后端全流程"
+	@echo "=========================================="
+	$(MAKE) -f Makefile.tensorrt up BACKEND=llm
+	@echo "等待服务就绪..."
+	@for i in $$(seq 1 60); do \
+		status=$$(curl -sf http://localhost:$(PORT)/health 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('status',''))" 2>/dev/null); \
+		if [ "$$status" = "ready" ]; then echo "服务就绪!"; break; fi; \
+		echo "  等待中... ($$i/60)"; sleep 5; \
+	done
+	$(MAKE) -f Makefile.tensorrt test
+
+pipeline-tensorrt: build export-onnx simplify-onnx build-engine
+	@echo "=========================================="
+	@echo "  TensorRT 后端全流程"
+	@echo "=========================================="
+	$(MAKE) -f Makefile.tensorrt up BACKEND=tensorrt
+	@echo "等待服务就绪..."
+	@for i in $$(seq 1 60); do \
+		status=$$(curl -sf http://localhost:$(PORT)/health 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('status',''))" 2>/dev/null); \
+		if [ "$$status" = "ready" ]; then echo "服务就绪!"; break; fi; \
+		echo "  等待中... ($$i/60)"; sleep 5; \
+	done
+	$(MAKE) -f Makefile.tensorrt test

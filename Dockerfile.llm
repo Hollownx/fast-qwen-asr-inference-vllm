@@ -1,0 +1,32 @@
+# Dockerfile.llm — 仅 LLM 后端，纯 transformers（无 vLLM / 无 TensorRT）
+# 使用 server_tensorrt.py，固定 ASR_BACKEND=llm，显存约 ~3.5GB
+
+ARG CUDA_VERSION=12.1.0
+ARG from=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+FROM ${from} AS base
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt update -y && apt upgrade -y && apt install -y --no-install-recommends \
+    git python3 python3-pip python3-dev wget vim \
+    libsndfile1 ffmpeg ca-certificates jq \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+WORKDIR /data/shared/Qwen3-ASR
+
+# 仅 PyTorch + transformers 栈（qwen-asr 不含 vllm/tensorrt）
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install -U pip setuptools wheel && \
+    pip3 install \
+        torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 && \
+    pip3 install \
+        "qwen-asr" \
+        fastapi "uvicorn[standard]" python-multipart \
+        soundfile scipy numpy psutil websockets
+
+RUN rm -rf /root/.cache/pip
+
+EXPOSE 8001
+
+CMD ["uvicorn", "server_tensorrt:app", "--host", "0.0.0.0", "--port", "8001"]

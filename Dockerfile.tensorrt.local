@@ -1,0 +1,47 @@
+# Dockerfile.tensorrt.local - 本地模型缓存版 Qwen3-ASR 服务
+# 说明：
+#   - 基础逻辑与 Dockerfile.tensorrt 相同
+#   - 通过环境变量默认启用 HuggingFace 本地缓存与离线模式
+#   - 建议配合 Makefile.tensorrt.local 与本地挂载的 hf_models 目录使用
+
+ARG CUDA_VERSION=12.1.0
+ARG from=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+FROM ${from} AS base
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt update -y && apt upgrade -y && apt install -y --no-install-recommends \
+    git python3 python3-pip python3-dev wget vim \
+    libsndfile1 ffmpeg ca-certificates jq \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+WORKDIR /data/shared/Qwen3-ASR
+
+# Python 依赖
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install -U pip setuptools wheel && \
+    pip3 install \
+        torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 && \
+    pip3 install \
+        "qwen-asr" \
+        fastapi "uvicorn[standard]" python-multipart \
+        soundfile scipy numpy psutil websockets
+
+# TensorRT Python 绑定（供 tensorrt 引擎后端使用，可选）
+# llm / torch_compile 后端不需要此包
+RUN pip3 install tensorrt pycuda || true
+
+RUN rm -rf /root/.cache/pip
+
+# 缺省启用 HF 本地缓存与离线模式（可被 docker run -e 覆盖）
+ENV HF_HOME=/data/shared/hf_models \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    HF_DATASETS_OFFLINE=1
+
+EXPOSE 8001
+
+# 使用本地入口模块（内部依旧复用 server_tensorrt.app）
+CMD ["uvicorn", "server_tensorrt_local:app", "--host", "0.0.0.0", "--port", "8001"]
+

@@ -1,0 +1,40 @@
+# Dockerfile.tensorrt - 不依赖 vLLM 的 Qwen3-ASR 服务
+# 支持三种后端（通过环境变量 ASR_BACKEND 切换）：
+#   llm              纯 transformers eager 推理（默认，~3.5GB 显存）
+#   torch_compile    + torch.compile(inductor) 内核融合加速
+#   torch_compile_trt + torch.compile(backend="tensorrt")，需额外安装 torch-tensorrt
+#   tensorrt         已构建的 .engine 文件
+
+ARG CUDA_VERSION=12.1.0
+ARG from=nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04
+FROM ${from} AS base
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt update -y && apt upgrade -y && apt install -y --no-install-recommends \
+    git python3 python3-pip python3-dev wget vim \
+    libsndfile1 ffmpeg ca-certificates jq \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -s /usr/bin/python3 /usr/bin/python
+
+WORKDIR /data/shared/Qwen3-ASR
+
+# Python 依赖
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip3 install -U pip setuptools wheel && \
+    pip3 install \
+        torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 && \
+    pip3 install \
+        "qwen-asr" \
+        fastapi "uvicorn[standard]" python-multipart \
+        soundfile scipy numpy psutil websockets
+
+# TensorRT Python 绑定（供 tensorrt 引擎后端使用，可选）
+# llm / torch_compile 后端不需要此包
+RUN pip3 install tensorrt pycuda || true
+
+RUN rm -rf /root/.cache/pip
+
+EXPOSE 8001
+
+CMD ["uvicorn", "server_tensorrt:app", "--host", "0.0.0.0", "--port", "8001"]

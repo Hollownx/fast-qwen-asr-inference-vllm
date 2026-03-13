@@ -1,0 +1,115 @@
+# =====================================================
+# Makefile.tensorrt.local — Qwen3-ASR TensorRT 本地模型版
+# =====================================================
+# 用法:
+#   make -f Makefile.tensorrt.local build
+#   make -f Makefile.tensorrt.local up BACKEND=llm|torch_compile|torch_compile_trt|tensorrt
+#   make -f Makefile.tensorrt.local down
+#   make -f Makefile.tensorrt.local logs
+#   ...
+#
+# 特点：
+#   - 镜像/容器单独命名（不会影响原有 Makefile.tensorrt 流程）
+#   - 默认挂载当前工程下的 ./hf_models 目录到容器 /data/shared/hf_models
+#   - ASR_MODEL_NAME 直接指向本地快照目录，严格走本地加载，不访问网络
+# =====================================================
+
+# -----------------------------
+# 镜像 & 容器
+# -----------------------------
+IMAGE              ?= qwen3-asr-trt-local:latest
+CONTAINER          ?= qwen3-asr-trt-local
+PORT               ?= 8908
+
+# -----------------------------
+# 模型配置（本地缓存）
+# -----------------------------
+ASR_MODEL_NAME     ?= Qwen/Qwen3-ASR-1.7B
+HF_HOME            ?= $(PWD)/hf_models
+
+# 对应你当前仓库里的本地快照路径（根据实际快照哈希调整）
+ASR_MODEL_SNAPSHOT_PATH ?= /data/shared/hf_models/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e70fe206f11671096ffdd38061171dd6e5
+
+# -----------------------------
+# 后端选择:
+#   llm              — 纯 transformers eager 推理（默认，最省显存 ~3.5GB）
+#   torch_compile    — + torch.compile(inductor)，内核融合加速
+#   torch_compile_trt — + torch.compile(backend="tensorrt")，需 torch-tensorrt
+#   tensorrt         — 已构建的 .engine 文件（目前模型不支持 ONNX 导出）
+# -----------------------------
+BACKEND            ?= llm
+ENGINE_FILE        ?= qwen3_asr_1.7b.engine
+ONNX_FILE          ?= qwen3_asr_1.7b.onnx
+ONNX_SIM_FILE      ?= qwen3_asr_1.7b_sim.onnx
+WORKSPACE_GB       ?= 4
+
+# -----------------------------
+# 测试 & 基准
+# -----------------------------
+FILES_DIR          ?= files
+BENCH_CLIENTS      ?= 4
+BENCH_REQUESTS     ?= 20
+
+.PHONY: build up down logs shell health
+
+# =====================================================
+# Docker 镜像构建
+# =====================================================
+build:
+	@echo "=========================================="
+	@echo "  构建 TensorRT 本地模型镜像: $(IMAGE)"
+	@echo "=========================================="
+	docker build --rm -f Dockerfile.tensorrt.local -t $(IMAGE) .
+
+# =====================================================
+# 容器启动 / 停止 / 日志
+# =====================================================
+up:
+	@echo "=========================================="
+	@echo "  启动 Qwen3-ASR TensorRT 本地模型服务"
+	@echo "=========================================="
+	@echo "  镜像:       $(IMAGE)"
+	@echo "  容器名:     $(CONTAINER)"
+	@echo "  端口:       $(PORT) → 8001"
+	@echo "  后端:       $(BACKEND)  (llm | torch_compile | torch_compile_trt | tensorrt)"
+	@echo "  模型ID:     $(ASR_MODEL_NAME)"
+	@echo "  模型快照:   $(ASR_MODEL_SNAPSHOT_PATH)"
+	@echo "  引擎文件:   $(ENGINE_FILE)"
+	@echo "  HF缓存:     $(HF_HOME)"
+	@echo "=========================================="
+	@read -p "确认启动? [y/N] " ans && [ $${ans:-N} = y ] || (echo "已取消." && exit 1)
+	mkdir -p $(FILES_DIR)
+	-docker rm -f $(CONTAINER) 2>/dev/null
+	docker run -d --name $(CONTAINER) \
+	  --restart=always \
+	  --gpus all --ipc=host \
+	  -p $(PORT):8001 \
+	  -e ASR_BACKEND=$(BACKEND) \
+	  -e ASR_MODEL_NAME=$(ASR_MODEL_SNAPSHOT_PATH) \
+	  -e ASR_TENSORRT_ENGINE=/data/shared/Qwen3-ASR/$(ENGINE_FILE) \
+	  -e HF_HOME="/data/shared/hf_models" \
+	  -e LISTEN_PORT=8001 \
+	  -e HF_HUB_OFFLINE=1 \
+	  -e TRANSFORMERS_OFFLINE=1 \
+	  -e HF_DATASETS_OFFLINE=1 \
+	  -v $(PWD):/data/shared/Qwen3-ASR \
+	  -v $(HF_HOME):/data/shared/hf_models \
+	  $(IMAGE)
+	@echo ""
+	@echo "容器已启动，正在跟踪日志 (Ctrl+C 退出日志)..."
+	@$(MAKE) -f Makefile.tensorrt.local logs
+
+down:
+	@echo "停止并删除容器: $(CONTAINER)"
+	-docker rm -f $(CONTAINER)
+
+logs:
+	docker logs -f $(CONTAINER)
+
+shell:
+	docker exec -it $(CONTAINER) bash
+
+health:
+	@echo "检查服务状态..."
+	@curl -sf http://localhost:$(PORT)/health | jq . || echo "服务未响应，请检查容器是否启动"
+

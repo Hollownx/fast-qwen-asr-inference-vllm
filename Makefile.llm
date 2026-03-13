@@ -1,0 +1,240 @@
+# =====================================================
+# Makefile.llm — 仅 LLM 后端，纯 transformers（无 vLLM / 无 TensorRT）  --restart=always
+# =====================================================
+# 用法:
+#   make -f Makefile.llm build              构建 Docker 镜像
+#   make -f Makefile.llm up                  启动服务并跟日志（会提示确认）
+#   make -f Makefile.llm start              仅启动容器（不跟日志，供脚本/pipeline 用）
+#   make -f Makefile.llm run-local          本地直接运行（不用 Docker）
+#   make -f Makefile.llm down                停止并删除容器
+#   make -f Makefile.llm logs                查看日志
+#   make -f Makefile.llm health              健康检查
+#   make -f Makefile.llm test                自动下载样本 + 批量测试
+#   make -f Makefile.llm test-streaming      流式测试
+#   make -f Makefile.llm test-batch          批量测试
+#   make -f Makefile.llm test-transcribe-ue  通过 /transcribe-ue 模拟 UE HTTP 调用
+#   make -f Makefile.llm benchmark-streaming 流式压测
+#   make -f Makefile.llm benchmark-batch     批量压测
+# =====================================================
+
+# -----------------------------
+# 镜像 & 容器
+# -----------------------------
+IMAGE              ?= qwen3-asr-llm:latest
+CONTAINER          ?= qwen3-asr-llm
+PORT               ?= 8908
+
+# -----------------------------
+# 模型配置
+# -----------------------------
+ASR_MODEL_NAME     ?= Qwen/Qwen3-ASR-1.7B
+HF_HOME            ?= /home/ld01/.cache/huggingface/hub
+
+# -----------------------------
+# 测试 & 基准
+# -----------------------------
+FILES_DIR          ?= files
+BENCH_CLIENTS      ?= 4
+BENCH_REQUESTS     ?= 20
+
+# -----------------------------
+# Targets
+# -----------------------------
+.PHONY: build up start down logs health \
+        test test-streaming test-batch test-transcribe-ue test-multi-batch \
+        setup-local run-local \
+        benchmark-streaming benchmark-batch \
+        shell pipeline
+
+# =====================================================
+# Docker 镜像构建
+# =====================================================
+build:
+	@echo "=========================================="
+	@echo "  构建 LLM（纯 transformers）镜像: $(IMAGE)"
+	@echo "=========================================="
+	docker build --rm -f Dockerfile.llm -t $(IMAGE) .
+
+# =====================================================
+# 容器启动 / 停止 / 日志
+# =====================================================
+# start: 仅启动容器（不跟日志，供 pipeline 使用）
+start:
+	@echo "=========================================="
+	@echo "  启动 Qwen3-ASR LLM 服务（纯 transformers）"
+	@echo "=========================================="
+	@echo "  镜像:       $(IMAGE)"
+	@echo "  容器名:     $(CONTAINER)"
+	@echo "  端口:       $(PORT) → 8001"
+	@echo "  后端:       llm（固定）"
+	@echo "  模型:       $(ASR_MODEL_NAME)"
+	@echo "  HF缓存:     $(HF_HOME)"
+	@echo "=========================================="
+	mkdir -p $(FILES_DIR)
+	-docker rm -f $(CONTAINER) 2>/dev/null
+	docker run -d --name $(CONTAINER) \
+	  --gpus all --ipc=host \
+	  --restart=always \
+	  -p $(PORT):8001 \
+	  -e ASR_BACKEND=llm \
+	  -e ASR_MODEL_NAME=$(ASR_MODEL_NAME) \
+	  -e HF_HOME="/data/shared/hf_models" \
+	  -e LISTEN_PORT=8001 \
+	  -e HF_HUB_OFFLINE=1 \
+	  -e TRANSFORMERS_OFFLINE=1 \
+	  -e HF_DATASETS_OFFLINE=1 \
+	  -v $(PWD):/data/shared/Qwen3-ASR \
+	  -v $(HF_HOME):/data/shared/hf_models \
+	  $(IMAGE)
+	@echo "容器已启动，可用 make -f Makefile.llm logs 查看日志"
+
+up:
+	@read -p "确认启动? [y/N] " ans && [ $${ans:-N} = y ] || (echo "已取消." && exit 1)
+	$(MAKE) -f Makefile.llm start
+	@echo ""
+	@echo "正在跟踪日志 (Ctrl+C 退出日志)..."
+	@$(MAKE) -f Makefile.llm logs
+
+down:
+	@echo "停止并删除容器: $(CONTAINER)"
+	-docker rm -f $(CONTAINER)
+
+logs:
+	docker logs -f $(CONTAINER)
+
+shell:
+	docker exec -it $(CONTAINER) bash
+
+# =====================================================
+# 健康检查
+# =====================================================
+health:
+	@echo "检查服务状态..."
+	@curl -sf http://localhost:$(PORT)/health | jq . || echo "服务未响应，请检查容器是否启动"
+
+# =====================================================
+# 本地运行（不用 Docker）
+# =====================================================
+setup-local:
+	@echo "初始化本地 Python 环境（安装基础依赖）..."
+	pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+	pip install qwen-asr fastapi uvicorn python-multipart soundfile scipy numpy psutil websockets
+	@echo "本地环境就绪"
+
+run-local:
+	@echo "本地启动 (llm 后端, 端口 $(PORT))..."
+	ASR_BACKEND=llm \
+	ASR_MODEL_NAME=$(ASR_MODEL_NAME) \
+	LISTEN_PORT=$(PORT) \
+	python server_tensorrt.py
+
+# =====================================================
+# 测试
+# =====================================================
+test: _download-samples test-batch
+	@echo "测试完成"
+
+_download-samples:
+	@mkdir -p $(FILES_DIR)
+	@for ext in m4a mp3 wav; do \
+		if [ ! -f "$(FILES_DIR)/reference.$$ext" ]; then \
+			echo "下载 reference.$$ext..."; \
+			wget -q -O $(FILES_DIR)/reference.$$ext \
+				https://raw.githubusercontent.com/kyr0/asr-sample-files/refs/heads/main/reference.$$ext; \
+		fi \
+	done
+
+test-batch:
+	@echo "=========================================="
+	@echo "  批量转录测试 (端口 $(PORT))"
+	@echo "=========================================="
+	@pass=0; fail=0; \
+	for ext in m4a mp3 wav; do \
+		file="$(FILES_DIR)/reference.$$ext"; \
+		if [ ! -f "$$file" ]; then echo "跳过: $$file 不存在"; continue; fi; \
+		echo "测试: $$file"; \
+		resp=$$(curl -s -X POST -F "files=@$$file" "http://localhost:$(PORT)/transcribe?language=de"); \
+		echo "  响应: $$resp"; \
+		if echo "$$resp" | grep -iq "referenz"; then \
+			echo "  ✓ 通过"; \
+			pass=$$((pass+1)); \
+		else \
+			echo "  ✗ 失败"; \
+			fail=$$((fail+1)); \
+		fi; \
+	done; \
+	echo ""; \
+	echo "结果: $$pass 通过, $$fail 失败"; \
+	if [ $$fail -gt 0 ]; then exit 1; fi
+
+test-streaming:
+	@echo "=========================================="
+	@echo "  流式转录测试 (端口 $(PORT))"
+	@echo "=========================================="
+	@if [ ! -f "$(FILES_DIR)/reference.pcm" ]; then \
+		echo "错误: $(FILES_DIR)/reference.pcm 不存在"; \
+		echo "  请准备 16kHz 16-bit mono PCM 文件"; \
+		exit 1; \
+	fi
+	python client-streaming.py \
+		-e ws://127.0.0.1:$(PORT)/transcribe-streaming \
+		-f $(FILES_DIR)/reference.pcm
+
+test-transcribe-ue: _download-samples
+	@echo "=========================================="
+	@echo "  UE HTTP /transcribe-ue 测试 (端口 $(PORT))"
+	@echo "=========================================="
+	@file="$(FILES_DIR)/reference.wav"; \
+	if [ ! -f "$$file" ]; then \
+		echo "错误: $$file 不存在，请先运行 make -f Makefile.llm _download-samples"; \
+		exit 1; \
+	fi; \
+	echo "使用 $$file 作为请求体 (Content-Type: application/octet-stream)"; \
+	curl -s -X POST \
+	  -H "Content-Type: application/octet-stream" \
+	  --data-binary "@$$file" \
+	  "http://127.0.0.1:$(PORT)/transcribe-ue" | jq .
+
+test-multi-batch:
+	@echo "多文件批量测试..."
+	@curl -s -X POST "http://127.0.0.1:$(PORT)/transcribe?language=de" \
+		-F "files=@$(FILES_DIR)/reference.m4a" \
+		-F "files=@$(FILES_DIR)/reference.mp3" \
+		-F "files=@$(FILES_DIR)/reference.wav" | jq .
+
+# =====================================================
+# 压力测试
+# =====================================================
+benchmark-streaming:
+	@echo "流式压测 (并发=$(BENCH_CLIENTS), 请求=$(BENCH_REQUESTS))..."
+	python benchmark.py \
+		--mode streaming \
+		--url ws://127.0.0.1:$(PORT)/transcribe-streaming \
+		--file $(FILES_DIR)/reference.pcm \
+		--clients $(BENCH_CLIENTS) \
+		--requests $(BENCH_REQUESTS)
+
+benchmark-batch:
+	@echo "批量压测 (并发=$(BENCH_CLIENTS), 请求=$(BENCH_REQUESTS))..."
+	python benchmark.py \
+		--mode batch \
+		--url http://127.0.0.1:$(PORT)/transcribe \
+		--file $(FILES_DIR)/reference.wav \
+		--clients $(BENCH_CLIENTS) \
+		--requests $(BENCH_REQUESTS)
+
+# =====================================================
+# 完整流水线：构建 → 启动 → 测试
+# =====================================================
+pipeline: build
+	@echo "=========================================="
+	@echo "  LLM（纯 transformers）全流程"
+	@echo "=========================================="
+	$(MAKE) -f Makefile.llm start
+	@echo "等待服务就绪..."
+	@for i in $$(seq 1 60); do \
+		status=$$(curl -sf http://localhost:$(PORT)/health 2>/dev/null | python3 -c "import sys,json;print(json.load(sys.stdin).get('status',''))" 2>/dev/null); \
+		if [ "$$status" = "ready" ]; then echo "服务就绪!"; break; fi; \
+		echo "  等待中... ($$i/60)"; sleep 5; \
+	done
+	$(MAKE) -f Makefile.llm test
