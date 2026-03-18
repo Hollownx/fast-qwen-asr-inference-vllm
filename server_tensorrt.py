@@ -46,7 +46,7 @@ UE HTTP /transcribe-ue 调用示例：
   LISTEN_HOST                                     (default: 0.0.0.0)
   LISTEN_PORT                                     (default: 8001)
   MAX_CONCURRENT_DECODE  音频解码并发上限          (default: 4)
-  MAX_CONCURRENT_INFER   GPU 推理并发上限          (default: 1)
+  MAX_CONCURRENT_INFER   GPU 推理并发上限          (default: 1)   #并发
   THREADPOOL_WORKERS     线程池大小                (default: cpu_count * 4)
   STREAM_MIN_SAMPLES     流式触发推理的最小样本数  (default: 1600, 即 100ms@16kHz)
   PARTIAL_INTERVAL_MS    partial 消息最小间隔(ms)  (default: 300)

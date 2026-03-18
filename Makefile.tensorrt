@@ -36,12 +36,11 @@ PORT               ?= 8908
 # 模型配置
 # -----------------------------
 ASR_MODEL_NAME     ?= Qwen/Qwen3-ASR-1.7B
-HF_HOME            ?= $(PWD)/hf_models
 
-#HF_HOME            ?= /home/ld01/.cache/huggingface/hub
+#HF_HOME            ?= $(PWD)/hf_models
+HF_HOME            ?= /home/ld01/.cache/huggingface/hub
 #C:\Users\你的用户名\.cache\huggingface\hub
-#/mnt/c/Users/你的用户名./cache/huggingface/hub
-#/root/.cache/huggingface/hub
+
 
 # -----------------------------
 # 后端选择:
@@ -107,11 +106,7 @@ up:
 	  -e ASR_BACKEND=$(BACKEND) \
 	  -e ASR_MODEL_NAME=$(ASR_MODEL_NAME) \
 	  -e ASR_TENSORRT_ENGINE=/data/shared/Qwen3-ASR/$(ENGINE_FILE) \
-	  -e HF_HOME="/data/shared/hf_models" \
 	  -e LISTEN_PORT=8001 \
-	  -e HF_HUB_OFFLINE=1 \
-	  -e TRANSFORMERS_OFFLINE=1 \
-	  -e HF_DATASETS_OFFLINE=1 \
 	  -v $(PWD):/data/shared/Qwen3-ASR \
 	  -v $(HF_HOME):/data/shared/hf_models \
 	  $(IMAGE)
