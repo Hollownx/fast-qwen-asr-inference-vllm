@@ -106,7 +106,9 @@ up:
 	  -e ASR_BACKEND=$(BACKEND) \
 	  -e ASR_MODEL_NAME=$(ASR_MODEL_NAME) \
 	  -e ASR_TENSORRT_ENGINE=/data/shared/Qwen3-ASR/$(ENGINE_FILE) \
-	  -e LISTEN_PORT=8001 -e HF_ENDPOINT=https://hf-mirror.com -e HF_HUB_OFFLINE=0 \   
+	  -e LISTEN_PORT=8001 \
+	  -e HF_ENDPOINT=https://hf-mirror.com \
+	  -e HF_HUB_OFFLINE=0 \   
 	  -v $(PWD):/data/shared/Qwen3-ASR \
 	  -v $(HF_HOME):/data/shared/hf_models \
 	  $(IMAGE)
