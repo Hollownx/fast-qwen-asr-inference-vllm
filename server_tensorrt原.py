@@ -38,16 +38,11 @@ UE HTTP /transcribe-ue 调用示例：
     --data-binary @files/reference.wav \\
     http://127.0.0.1:8001/transcribe-ue
 
-
-http://127.0.0.1:8001/transcribe-ue?vocal_isolation_strength=1.25&rms_threshold=0.4
-
 环境变量一览：
   ASR_BACKEND            llm | torch_compile | torch_compile_trt | tensorrt  (default: llm)
-  ASR_MODEL_NAME         HuggingFace 模型 ID/本地路径 (default: Qwen/Qwen3-ASR-0.6B)
+  ASR_MODEL_NAME         HuggingFace 模型 ID      (default: Qwen/Qwen3-ASR-1.7B)
   TORCH_DTYPE            float16 | bfloat16       (default: float16)
   ASR_TENSORRT_ENGINE    .engine 文件路径          (default: qwen3_asr_1.7b.engine)
-  HF_LOCAL_ONLY          HuggingFace 仅本地离线加载 (default: true)
-  HF_MODEL_CACHE_DIR     HuggingFace 本地缓存根目录 (default: hf_models)
   LISTEN_HOST                                     (default: 0.0.0.0)
   LISTEN_PORT                                     (default: 8001)
   MAX_CONCURRENT_DECODE  音频解码并发上限          (default: 4)
@@ -56,15 +51,6 @@ http://127.0.0.1:8001/transcribe-ue?vocal_isolation_strength=1.25&rms_threshold=
   STREAM_MIN_SAMPLES     流式触发推理的最小样本数  (default: 1600, 即 100ms@16kHz)
   PARTIAL_INTERVAL_MS    partial 消息最小间隔(ms)  (default: 300)
   STREAM_EXPECT_SR       流式期望采样率            (default: 16000)
-  EXPORT_INPUT_AUDIO     是否导出输入音频          (default: true)
-  EXPORT_INPUT_AUDIO_DIR 导出目录                  (default: exported_audio)
-  UE_ENABLE_VOCAL_ISOLATION    /transcribe-ue 人声分离预处理开关   (default: false)
-  UE_EXPORT_PREPROCESSED_AUDIO 是否导出预处理后音频               (default: 同 EXPORT_INPUT_AUDIO)
-  UE_VOCAL_ISOLATION_STRENGTH  人声分离强度                       (default: 1.25)
-  UE_ENABLE_THRESHOLD_FILTER   /transcribe-ue 阈值过滤开关         (default: true)
-  UE_THRESHOLD_FILTER_RMS      /transcribe-ue RMS 阈值             (default: 0.4)
-  UE_THRESHOLD_FILTER_FRAME_MS 阈值过滤帧长(ms)                   (default: 20)
-  UE_THRESHOLD_FILTER_PAD_MS   阈值过滤保留边界(ms)               (default: 120)
 """
 
 # =============================================================================
@@ -73,18 +59,13 @@ http://127.0.0.1:8001/transcribe-ue?vocal_isolation_strength=1.25&rms_threshold=
 import os
 import io
 import json
-import re
 import asyncio
 import logging
 import subprocess
 import time
-import wave
-from pathlib import Path
 from typing import Optional, List, Tuple, Any
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from uuid import uuid4
 
 # =============================================================================
 # 第三方库
@@ -94,7 +75,7 @@ import numpy as np
 import soundfile as sf
 import torch
 import psutil
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Query, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # =============================================================================
@@ -119,13 +100,21 @@ def map_language(lang_code: Optional[str]) -> Optional[str]:
     if lang_code is None:
         return None
 
-    # 当前服务只显式映射最常用的几种语言，其他值透传给下游模型。
+    # mapping = {
+    #     "en": "English", "de": "German", "fr": "French", "es": "Spanish",
+    #     "it": "Italian", "ja": "Japanese", "ko": "Korean", "zh": "Chinese",
+    #     "ru": "Russian", "pt": "Portuguese", "nl": "Dutch", "tr": "Turkish",
+    #     "sv": "Swedish", "id": "Indonesian", "vi": "Vietnamese",
+    #     "hi": "Hindi", "ar": "Arabic",
+    # }
     mapping = {"en": "English", "zh": "Chinese"}
+
+
     return mapping.get(lang_code.lower(), lang_code)
 
 
-def read_audio_file(file_bytes: bytes) -> Tuple[np.ndarray, int]:
-    """同步解码音频，统一输出为 `float32` waveform + sample rate。"""
+def read_audio_file(file_bytes: bytes) -> Tuple[np.ndarray, int]:   #是输出格式，不是输入限制，soundfile 内部会自动把任何格式（int16、int24、float32、float64）转成 float32 读出来。
+    """同步解码音频：soundfile 优先，回退 ffmpeg"""
     try:
         with io.BytesIO(file_bytes) as f:
             wav, sr = sf.read(f, dtype="float32", always_2d=False)
@@ -146,482 +135,23 @@ def read_audio_file(file_bytes: bytes) -> Tuple[np.ndarray, int]:
 # 配置
 # =============================================================================
 ASR_BACKEND = os.getenv("ASR_BACKEND", "llm").lower()  # llm | torch_compile | torch_compile_trt | tensorrt
-ASR_MODEL_NAME = os.getenv("ASR_MODEL_NAME", "Qwen/Qwen3-ASR-0.6B")
+ASR_MODEL_NAME = os.getenv("ASR_MODEL_NAME", "Qwen/Qwen3-ASR-1.7B")
 TORCH_DTYPE = os.getenv("TORCH_DTYPE", "float16")  # float16 | bfloat16
 ASR_TENSORRT_ENGINE = os.getenv("ASR_TENSORRT_ENGINE", "qwen3_asr_1.7b.engine")
-HF_LOCAL_ONLY = get_env_bool("HF_LOCAL_ONLY", "true")
-HF_MODEL_CACHE_DIR = Path(os.getenv("HF_MODEL_CACHE_DIR", "hf_models"))
 
-# 服务监听配置
 LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8001"))
 
-# 输入音频导出与 UE 预处理配置  <= 0：关闭该步骤
-EXPORT_INPUT_AUDIO = get_env_bool("EXPORT_INPUT_AUDIO", "false")
-EXPORT_INPUT_AUDIO_DIR = Path(os.getenv("EXPORT_INPUT_AUDIO_DIR", "exported_audio"))
-# UE 人声增强配置  越大：背景压得越狠，但也更容易把弱语音、尾音、混响一起削掉。
-UE_ENABLE_VOCAL_ISOLATION = get_env_bool("UE_ENABLE_VOCAL_ISOLATION", "false")
-UE_EXPORT_PREPROCESSED_AUDIO = get_env_bool(
-    "UE_EXPORT_PREPROCESSED_AUDIO",
-    "true" if EXPORT_INPUT_AUDIO else "false",
-)
-UE_VOCAL_ISOLATION_STRENGTH = float(os.getenv("UE_VOCAL_ISOLATION_STRENGTH", "1.25"))
-
-# UE RMS 阈值过滤配置
-UE_ENABLE_THRESHOLD_FILTER = get_env_bool("UE_ENABLE_THRESHOLD_FILTER", "true")
-UE_THRESHOLD_FILTER_RMS = float(os.getenv("UE_THRESHOLD_FILTER_RMS", "0.4")) 
-UE_THRESHOLD_FILTER_FRAME_MS = int(os.getenv("UE_THRESHOLD_FILTER_FRAME_MS", "20"))  #检测窗口时长
-UE_THRESHOLD_FILTER_PAD_MS = int(os.getenv("UE_THRESHOLD_FILTER_PAD_MS", "120")) #音频填充/缓冲时长
- 
-# 并发与线程池配置
-MAX_CONCURRENT_DECODE = int(os.getenv("MAX_CONCURRENT_DECODE", "4"))  # 音频解码并发数
-MAX_CONCURRENT_INFER = int(os.getenv("MAX_CONCURRENT_INFER", "20"))  # GPU 推理并发数
+MAX_CONCURRENT_DECODE = int(os.getenv("MAX_CONCURRENT_DECODE", "4")) # 音频解码并发数，通常为4
+MAX_CONCURRENT_INFER = int(os.getenv("MAX_CONCURRENT_INFER", "1"))  # GPU 推理并发数，通常为1
 THREADPOOL_WORKERS = int(os.getenv("THREADPOOL_WORKERS", str((os.cpu_count() or 4) * 4)))
 
-# 流式接口配置
-STREAM_MIN_SAMPLES = int(os.getenv("STREAM_MIN_SAMPLES", "16000"))  # 达到该样本数即触发推理
-STREAM_SILENCE_RMS = float(os.getenv("STREAM_SILENCE_RMS", "0"))  # 低于该 RMS 的 chunk 会被丢弃
-PARTIAL_INTERVAL_MS = int(os.getenv("PARTIAL_INTERVAL_MS", "0"))  # partial 最小间隔；0 表示不节流
+STREAM_MIN_SAMPLES = int(os.getenv("STREAM_MIN_SAMPLES", "16000"))   # 100ms @16kHz，达到即触发推理
+STREAM_SILENCE_RMS = float(os.getenv("STREAM_SILENCE_RMS", "0"))    # 静音 chunk RMS 阈值，低于则丢弃；0=不过滤
+PARTIAL_INTERVAL_MS = int(os.getenv("PARTIAL_INTERVAL_MS", "0"))  # partial 消息最小间隔(ms)300  不节流 为0
 STREAM_EXPECT_SR = int(os.getenv("STREAM_EXPECT_SR", "16000"))
 
 SAMPLE_RATE = 16000
-
-#下载过后
-if HF_LOCAL_ONLY:
-    # 强制让 transformers / huggingface_hub 只看本地目录和缓存，不做联网探测。
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-
-
-# =============================================================================
-# HuggingFace 本地离线加载辅助
-# =============================================================================
-
-
-def _resolve_hf_snapshot_dir(cache_root: Path, model_id: str) -> Optional[Path]:
-    repo_parts = [part for part in model_id.strip("/").split("/") if part]
-    if len(repo_parts) < 2:
-        return None
-
-    repo_cache_dir = cache_root / f"models--{'--'.join(repo_parts)}"
-    snapshots_dir = repo_cache_dir / "snapshots"
-    refs_main = repo_cache_dir / "refs" / "main"
-
-    if refs_main.is_file():
-        revision = refs_main.read_text(encoding="utf-8").strip()
-        snapshot_dir = snapshots_dir / revision
-        if snapshot_dir.is_dir():
-            return snapshot_dir.resolve()
-
-    if snapshots_dir.is_dir():
-        snapshots = sorted(
-            (p for p in snapshots_dir.iterdir() if p.is_dir()),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if snapshots:
-            return snapshots[0].resolve()
-
-    return None
-
-
-def resolve_hf_model_source(model_id: str) -> Tuple[str, dict]:
-    """
-    优先将 repo id 解析到工作区本地目录或 hf 缓存 snapshot，尽量不让 HF 代码碰网络。
-    找不到明确本地目录时，再退回 repo id + local_files_only/cache_dir。
-    """
-    expanded = Path(model_id).expanduser()
-    if expanded.is_dir():
-        return str(expanded.resolve()), {}
-
-    local_dir = Path(model_id.split("/")[-1])
-    if local_dir.is_dir():
-        return str(local_dir.resolve()), {}
-
-    for cache_root in (HF_MODEL_CACHE_DIR, HF_MODEL_CACHE_DIR / "hub"):
-        snapshot_dir = _resolve_hf_snapshot_dir(cache_root, model_id)
-        if snapshot_dir is not None:
-            return str(snapshot_dir), {}
-
-    hf_kwargs = {}
-    if HF_MODEL_CACHE_DIR.exists():
-        hf_kwargs["cache_dir"] = str(HF_MODEL_CACHE_DIR.resolve())
-    if HF_LOCAL_ONLY:
-        hf_kwargs["local_files_only"] = True
-    return model_id, hf_kwargs
-
-# =============================================================================
-# 音频导出辅助
-# =============================================================================
-
-
-def _sanitize_name(name: Optional[str], default: str = "audio") -> str:
-    raw = Path(name).stem if name else default
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", raw).strip("._-")
-    return cleaned or default
-
-
-def _build_audio_dump_path(source: str, original_name: Optional[str] = None, suffix: str = ".wav") -> Path:
-    safe_source = _sanitize_name(source, default="source")
-    safe_name = _sanitize_name(original_name, default="audio")
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    ms = int((time.time() % 1) * 1000)
-    return EXPORT_INPUT_AUDIO_DIR / f"{ts}_{ms:03d}_{safe_source}_{safe_name}_{uuid4().hex[:8]}{suffix}"
-
-
-def dump_audio_file(
-    wav: np.ndarray,
-    sr: int,
-    source: str,
-    original_name: Optional[str] = None,
-    *,
-    enabled: bool = True,
-) -> Optional[Path]:
-    """将输入音频导出为 PCM16 WAV，失败时只记录日志，不影响主流程。"""
-    if not enabled:
-        return None
-
-    try:
-        EXPORT_INPUT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-        path = _build_audio_dump_path(source=source, original_name=original_name, suffix=".wav")
-        wav = np.asarray(wav)
-        if wav.dtype != np.float32:
-            wav = wav.astype(np.float32)
-        sf.write(str(path), wav, sr, subtype="PCM_16")
-        logger.info("已导出输入音频: %s", path)
-        return path
-    except Exception as e:
-        logger.warning("导出输入音频失败(source=%s, original_name=%s): %s", source, original_name, e)
-        return None
-
-
-class StreamingAudioDumper:
-    """将流式 PCM16LE 音频边接收边写入 WAV，避免在内存中累积完整会话。"""
-
-    def __init__(self, path: Path, sample_rate: int):
-        self.path = path
-        self.sample_rate = sample_rate
-        self.frames = 0
-        self._writer = wave.open(str(path), "wb")
-        self._writer.setnchannels(1)
-        self._writer.setsampwidth(2)
-        self._writer.setframerate(sample_rate)
-
-    def write(self, raw_pcm_s16le: bytes):
-        if not raw_pcm_s16le:
-            return
-        self._writer.writeframes(raw_pcm_s16le)
-        self.frames += len(raw_pcm_s16le) // 2
-
-    def close(self):
-        writer = getattr(self, "_writer", None)
-        if writer is None:
-            return
-        writer.close()
-        self._writer = None
-        logger.info(
-            "已导出流式输入音频: %s (%d samples @ %dHz)",
-            self.path,
-            self.frames,
-            self.sample_rate,
-        )
-
-
-def create_streaming_audio_dumper(source: str, sample_rate: int) -> Optional[StreamingAudioDumper]:
-    if not EXPORT_INPUT_AUDIO:
-        return None
-
-    try:
-        EXPORT_INPUT_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
-        path = _build_audio_dump_path(source=source, original_name="stream", suffix=".wav")
-        return StreamingAudioDumper(path=path, sample_rate=sample_rate)
-    except Exception as e:
-        logger.warning("创建流式音频导出器失败(source=%s): %s", source, e)
-        return None
-
-
-# =============================================================================
-# UE /transcribe-ue 预处理辅助
-# =============================================================================
-
-
-@dataclass(frozen=True)
-class UEPreprocessConfig:
-    vocal_isolation_enabled: bool
-    vocal_isolation_strength: float
-    threshold_filter_enabled: bool
-    threshold_filter_rms: float
-    threshold_filter_frame_ms: int
-    threshold_filter_pad_ms: int
-
-
-def resolve_ue_preprocess_config(
-    vocal_isolation_strength: Optional[float] = None,
-    rms_threshold: Optional[float] = None,
-) -> UEPreprocessConfig:
-    """
-    解析一次 /transcribe-ue 请求的有效预处理配置。
-    规则：
-    - query 参数为 `None`：沿用服务默认值。
-    - query 参数 `<= 0`：视为关闭该步骤。
-    - query 参数 `> 0`：启用该步骤，并使用该值。
-    """
-    if vocal_isolation_strength is None:
-        effective_vocal_strength = max(0.0, UE_VOCAL_ISOLATION_STRENGTH)
-        vocal_enabled = UE_ENABLE_VOCAL_ISOLATION and effective_vocal_strength > 0
-    else:
-        effective_vocal_strength = max(0.0, vocal_isolation_strength)
-        vocal_enabled = effective_vocal_strength > 0
-
-    if rms_threshold is None:
-        effective_rms_threshold = max(0.0, UE_THRESHOLD_FILTER_RMS)
-        threshold_enabled = UE_ENABLE_THRESHOLD_FILTER and effective_rms_threshold > 0
-    else:
-        effective_rms_threshold = max(0.0, rms_threshold)
-        threshold_enabled = effective_rms_threshold > 0
-
-    return UEPreprocessConfig(
-        vocal_isolation_enabled=vocal_enabled,
-        vocal_isolation_strength=effective_vocal_strength,
-        threshold_filter_enabled=threshold_enabled,
-        threshold_filter_rms=effective_rms_threshold,
-        threshold_filter_frame_ms=max(5, UE_THRESHOLD_FILTER_FRAME_MS),
-        threshold_filter_pad_ms=max(0, UE_THRESHOLD_FILTER_PAD_MS),
-    )
-
-
-def _chunk_rms(wav: np.ndarray) -> float:
-    wav = np.asarray(wav, dtype=np.float32)
-    if wav.size == 0:
-        return 0.0
-    wav64 = wav.astype(np.float64, copy=False)
-    return float(np.sqrt(np.mean(wav64 * wav64)))
-
-
-def _safe_audio(wav: np.ndarray) -> np.ndarray:
-    wav = np.nan_to_num(np.asarray(wav, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-    return np.clip(wav, -1.0, 1.0).astype(np.float32, copy=False)
-
-
-def _mix_to_mono_for_speech_focus(wav: np.ndarray) -> np.ndarray:
-    wav = np.asarray(wav, dtype=np.float32)
-    if wav.ndim == 1:
-        return _safe_audio(wav)
-    if wav.ndim == 2:
-        if wav.shape[1] == 1:
-            return _safe_audio(wav[:, 0])
-        if wav.shape[1] >= 2:
-            left = wav[:, 0]
-            right = wav[:, 1]
-            center = 0.5 * (left + right)
-            if wav.shape[1] > 2:
-                extra = np.mean(wav[:, 2:], axis=1, dtype=np.float32)
-                center = 0.85 * center + 0.15 * extra
-            return _safe_audio(center)
-    return _safe_audio(wav.reshape(-1))
-
-
-def _apply_sos_filter(sos: np.ndarray, wav: np.ndarray) -> np.ndarray:
-    from scipy.signal import sosfilt, sosfiltfilt
-
-    if wav.size < 32:
-        return wav.astype(np.float32, copy=False)
-
-    try:
-        return sosfiltfilt(sos, wav).astype(np.float32)
-    except ValueError:
-        return sosfilt(sos, wav).astype(np.float32)
-
-
-def _apply_ue_vocal_isolation(
-    wav: np.ndarray,
-    sr: int,
-    reference_wav: np.ndarray,
-    config: UEPreprocessConfig,
-) -> np.ndarray:
-    """
-    轻量级“人声增强”而非严格源分离，目标是提升 ASR 前景语音占比。
-    处理顺序：
-    1. 带通滤波，先聚焦语音主频段。
-    2. 基于短时频谱估计噪声底，做软掩蔽抑制背景。
-    3. 用输入 RMS 做一次温和补偿，避免增强后音量掉太多。
-    """
-    try:
-        from scipy.ndimage import uniform_filter
-        from scipy.signal import butter, istft, stft
-    except ImportError:
-        logger.warning("UE 人声分离预处理跳过: scipy 不可用")
-        return wav
-
-    try:
-        nyquist = sr * 0.5
-        low_hz = max(80.0, min(120.0, nyquist * 0.45))
-        high_hz = min(4800.0, nyquist - 120.0)
-        if high_hz <= low_hz + 100.0:
-            return wav
-
-        strength = max(0.6, min(3.0, config.vocal_isolation_strength))
-        peak = float(np.max(np.abs(wav)))
-        norm = wav / peak if peak > 1.0 else wav.copy()
-
-        # 第 1 步：先做语音频段带通，削掉明显无关的低频/高频能量。
-        sos = butter(4, [low_hz, high_hz], btype="bandpass", fs=sr, output="sos")
-        bandpassed = _apply_sos_filter(sos, norm)
-
-        nperseg = int(2 ** np.round(np.log2(max(256, min(2048, sr * 0.032)))))
-        nperseg = min(nperseg, bandpassed.size)
-        if nperseg < 128:
-            return _safe_audio(bandpassed)
-
-        noverlap = min(nperseg - 1, nperseg * 3 // 4)
-        _, _, zxx = stft(bandpassed, fs=sr, nperseg=nperseg, noverlap=noverlap)
-        if zxx.size == 0:
-            return _safe_audio(bandpassed)
-
-        # 第 2 步：用低能量帧估计噪声底，再做平滑后的软掩蔽。
-        mag = np.abs(zxx)
-        frame_energy = np.mean(mag, axis=0)
-        noise_frames = np.argsort(frame_energy)[:max(6, frame_energy.size // 8)]
-        noise_profile = np.median(mag[:, noise_frames], axis=1, keepdims=True)
-        threshold = noise_profile * strength
-
-        mask = np.clip((mag - threshold) / (mag + 1e-6), 0.0, 1.0)
-        mask = uniform_filter(mask, size=(3, 5), mode="nearest")
-
-        freqs = np.linspace(0.0, nyquist, mag.shape[0], dtype=np.float32)
-        speech_weight = np.where(
-            (freqs >= low_hz) & (freqs <= high_hz),
-            1.0,
-            0.35,
-        ).astype(np.float32)[:, None]
-        mask = np.clip(mask * speech_weight, 0.02, 1.0)
-
-        # 第 3 步：逆 STFT 回时域，并做一次温和的能量回补。
-        _, enhanced = istft(zxx * mask, fs=sr, nperseg=nperseg, noverlap=noverlap)
-        if enhanced.size < bandpassed.size:
-            enhanced = np.pad(enhanced, (0, bandpassed.size - enhanced.size))
-        enhanced = enhanced[:bandpassed.size]
-
-        processed = 0.8 * enhanced.astype(np.float32) + 0.2 * bandpassed
-        in_rms = _chunk_rms(reference_wav)
-        out_rms = _chunk_rms(processed)
-        if in_rms > 1e-6 and out_rms > 1e-6:
-            processed = processed * min(3.0, in_rms / out_rms)
-
-        processed = _safe_audio(processed)
-        logger.info(
-            "UE 人声分离预处理完成: sr=%d samples=%d rms_in=%.6f rms_out=%.6f strength=%.2f",
-            sr,
-            reference_wav.size,
-            in_rms,
-            _chunk_rms(processed),
-            strength,
-        )
-        return processed
-    except Exception as e:
-        logger.warning("UE 人声分离预处理失败，回退到原始单声道: %s", e)
-        return wav
-
-
-def apply_ue_threshold_filter(wav: np.ndarray, sr: int, config: UEPreprocessConfig) -> np.ndarray:
-    """
-    基于短时 RMS 的门限过滤。
-    低于阈值的短帧会被衰减到 0，同时通过前后扩张保留语音边界，避免吃字头字尾。
-    """
-    wav = _safe_audio(wav)
-    if wav.size == 0 or not config.threshold_filter_enabled:
-        return wav
-
-    threshold = max(0.0, config.threshold_filter_rms)
-    if threshold <= 0.0 or sr <= 0:
-        return wav
-
-    frame_ms = max(5, config.threshold_filter_frame_ms)
-    pad_ms = max(0, config.threshold_filter_pad_ms)
-    frame_len = max(64, int(sr * frame_ms / 1000))
-    hop = max(32, frame_len // 2)
-
-    if wav.size <= frame_len:
-        rms = _chunk_rms(wav)
-        return wav if rms >= threshold else np.zeros_like(wav, dtype=np.float32)
-
-    frame_starts = list(range(0, wav.size, hop))
-    frame_rms = np.empty(len(frame_starts), dtype=np.float32)
-    for i, start in enumerate(frame_starts):
-        end = min(start + frame_len, wav.size)
-        frame_rms[i] = _chunk_rms(wav[start:end])
-
-    keep = frame_rms >= threshold
-    if np.any(keep):
-        pad_frames = int(np.ceil((pad_ms / 1000.0) * sr / hop))
-        if pad_frames > 0:
-            kernel = np.ones(pad_frames * 2 + 1, dtype=np.int16)
-            keep = np.convolve(keep.astype(np.int16), kernel, mode="same") > 0
-    else:
-        logger.info(
-            "UE 阈值过滤后无保留帧: samples=%d sr=%d threshold=%.6f",
-            wav.size,
-            sr,
-            threshold,
-        )
-        return np.zeros_like(wav, dtype=np.float32)
-
-    gate = np.zeros(wav.size, dtype=np.float32)
-    weight = np.zeros(wav.size, dtype=np.float32)
-    window = np.hanning(frame_len).astype(np.float32)
-    if frame_len <= 2:
-        window = np.ones(frame_len, dtype=np.float32)
-    else:
-        window = np.maximum(window, 1e-3)
-
-    for keep_flag, start in zip(keep, frame_starts):
-        end = min(start + frame_len, wav.size)
-        win = window[: end - start]
-        weight[start:end] += win
-        if keep_flag:
-            gate[start:end] += win
-
-    mask = np.divide(gate, weight, out=np.zeros_like(gate), where=weight > 1e-6)
-    filtered = wav * mask
-    logger.info(
-        "UE 阈值过滤完成: sr=%d samples=%d threshold=%.6f kept_ratio=%.3f",
-        sr,
-        wav.size,
-        threshold,
-        float(np.mean(keep.astype(np.float32))),
-    )
-    return _safe_audio(filtered)
-
-
-def preprocess_ue_audio_for_asr(
-    wav: np.ndarray,
-    sr: int,
-    config: Optional[UEPreprocessConfig] = None,
-) -> np.ndarray:
-    """
-    /transcribe-ue 专用轻量预处理：
-    1. 多声道中心提取/转单声道
-    2. 可选的人声增强
-    3. 可选的阈值过滤
-
-    这不是 Demucs 级别的深度源分离，但对 ASR 前的人声增强更轻、更稳。
-    """
-    config = config or resolve_ue_preprocess_config()
-    mono = _mix_to_mono_for_speech_focus(wav)
-    if mono.size == 0:
-        return mono
-    processed = mono
-
-    # 主步骤 1：如果开启了人声增强，优先提升语音和背景的分离度。
-    if config.vocal_isolation_enabled and sr >= 4000 and mono.size >= max(512, sr // 20):
-        processed = _apply_ue_vocal_isolation(processed, sr, reference_wav=mono, config=config)
-
-    # 主步骤 2：再做门限过滤，压掉低能量噪声段。
-    if config.threshold_filter_enabled:
-        processed = apply_ue_threshold_filter(processed, sr, config)
-
-    return _safe_audio(processed)
 
 # =============================================================================
 # 全局状态
@@ -679,20 +209,11 @@ class QwenASRBackend:
         except ImportError as e:
             raise ImportError("请安装 qwen-asr: pip install qwen-asr") from e
 
-        model_source, hf_kwargs = resolve_hf_model_source(model_id)
-        logger.info(
-            "加载 Qwen3ASRModel: requested=%s resolved=%s dtype=%s compile=%s local_only=%s",
-            model_id,
-            model_source,
-            dtype,
-            compile_backend,
-            HF_LOCAL_ONLY,
-        )
+        logger.info(f"加载 Qwen3ASRModel: {model_id}  dtype={dtype}  compile={compile_backend}")
         self._qwen = Qwen3ASRModel.from_pretrained(
-            model_source,
+            model_id,
             dtype=dtype,
             device_map="cuda:0",
-            **hf_kwargs,
         )
 
         if compile_backend is not None:
@@ -775,7 +296,6 @@ class TensorRTASRBackend:
 
         self._trt = trt_lib
         self._cuda = cuda_drv
-        model_source, hf_kwargs = resolve_hf_model_source(model_id)
 
         logger.info(f"加载 TensorRT 引擎: {engine_path}")
         trt_logger = trt_lib.Logger(trt_lib.Logger.WARNING)
@@ -789,17 +309,12 @@ class TensorRTASRBackend:
         self._idx_input_m = self._engine.get_binding_index("attention_mask")
         self._idx_logits = self._engine.get_binding_index("logits")
 
-        logger.info(
-            "加载 Processor/Tokenizer: requested=%s resolved=%s local_only=%s",
-            model_id,
-            model_source,
-            HF_LOCAL_ONLY,
-        )
-        self.processor = AutoProcessor.from_pretrained(model_source, **hf_kwargs)
+        logger.info(f"加载 Processor: {model_id}")
+        self.processor = AutoProcessor.from_pretrained(model_id)
         self._tokenizer = getattr(self.processor, "tokenizer", None)
         if self._tokenizer is None or not hasattr(self._tokenizer, "decode"):
             from transformers import AutoTokenizer
-            self._tokenizer = AutoTokenizer.from_pretrained(model_source, **hf_kwargs)
+            self._tokenizer = AutoTokenizer.from_pretrained(model_id)
 
         self.sample_rate = SAMPLE_RATE
         logger.info("TensorRTASRBackend 初始化完成")
@@ -954,25 +469,6 @@ async def to_thread_limited(sem: asyncio.Semaphore, fn, *args, **kwargs):
 async def lifespan(app: FastAPI):
     global decode_sem, infer_sem
     logger.info("启动 Qwen3-ASR TensorRT 服务...")
-    if EXPORT_INPUT_AUDIO:
-        logger.info("输入音频导出已开启: %s", EXPORT_INPUT_AUDIO_DIR.resolve())
-    else:
-        logger.info("输入音频导出已关闭")
-    logger.info(
-        "HF 离线本地加载: local_only=%s cache_dir=%s",
-        HF_LOCAL_ONLY,
-        HF_MODEL_CACHE_DIR.resolve(),
-    )
-    logger.info(
-        "/transcribe-ue 预处理: vocal_isolation=%s strength=%.2f threshold_filter=%s threshold_rms=%.6f frame_ms=%d pad_ms=%d export_preprocessed=%s",
-        UE_ENABLE_VOCAL_ISOLATION,
-        UE_VOCAL_ISOLATION_STRENGTH,
-        UE_ENABLE_THRESHOLD_FILTER,
-        UE_THRESHOLD_FILTER_RMS,
-        UE_THRESHOLD_FILTER_FRAME_MS,
-        UE_THRESHOLD_FILTER_PAD_MS,
-        UE_EXPORT_PREPROCESSED_AUDIO,
-    )
 
     decode_sem = asyncio.Semaphore(MAX_CONCURRENT_DECODE)
     infer_sem = asyncio.Semaphore(MAX_CONCURRENT_INFER)
@@ -1023,31 +519,12 @@ async def health():
         "backend": ASR_BACKEND,
         "dtype": TORCH_DTYPE,
         "model": ASR_MODEL_NAME,
-        "hf_loading": {
-            "local_only": HF_LOCAL_ONLY,
-            "cache_dir": str(HF_MODEL_CACHE_DIR),
-        },
         "limits": {
             "max_concurrent_decode": MAX_CONCURRENT_DECODE,
             "max_concurrent_infer": MAX_CONCURRENT_INFER,
             "threadpool_workers": THREADPOOL_WORKERS,
             "stream_min_samples": STREAM_MIN_SAMPLES,
             "stream_silence_rms": STREAM_SILENCE_RMS,
-        },
-        "input_audio_dump": {
-            "enabled": EXPORT_INPUT_AUDIO,
-            "dir": str(EXPORT_INPUT_AUDIO_DIR),
-        },
-        "ue_audio_preprocess": {
-            "vocal_isolation": UE_ENABLE_VOCAL_ISOLATION,
-            "export_preprocessed_audio": UE_EXPORT_PREPROCESSED_AUDIO,
-            "strength": UE_VOCAL_ISOLATION_STRENGTH,
-            "threshold_filter": {
-                "enabled": UE_ENABLE_THRESHOLD_FILTER,
-                "rms": UE_THRESHOLD_FILTER_RMS,
-                "frame_ms": UE_THRESHOLD_FILTER_FRAME_MS,
-                "pad_ms": UE_THRESHOLD_FILTER_PAD_MS,
-            },
         },
         "memory": {
             "ram_total_mb": mem.total // (1024 * 1024),
@@ -1076,21 +553,12 @@ async def transcribe(
 
     full_lang = map_language(language)
 
-    async def decode_one(idx: int, f: UploadFile):
+    async def decode_one(f: UploadFile):
         content = await f.read()
-        wav, sr = await to_thread_limited(decode_sem, read_audio_file, content)
-        await asyncio.to_thread(
-            dump_audio_file,
-            wav,
-            sr,
-            f"transcribe_{idx}",
-            f.filename,
-            enabled=EXPORT_INPUT_AUDIO,
-        )
-        return wav, sr
+        return await to_thread_limited(decode_sem, read_audio_file, content)
 
     try:
-        audio_batch = await asyncio.gather(*(decode_one(idx, f) for idx, f in enumerate(files)))
+        audio_batch = await asyncio.gather(*(decode_one(f) for f in files))
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid audio: {e}")
 
@@ -1147,7 +615,6 @@ async def websocket_streaming(
     audio_buf: List[np.ndarray] = []
     audio_buf_n = 0
     last_partial_ts = 0.0
-    stream_audio_dumper: Optional[StreamingAudioDumper] = None
 
     async def do_inference_and_send(*, is_final: bool):
         """对当前缓冲区中的积累音频执行推理并发送结果"""
@@ -1213,13 +680,6 @@ async def websocket_streaming(
                             await ws.close(code=1003)
                             return
 
-                        if stream_audio_dumper is not None:
-                            stream_audio_dumper.close()
-                        stream_audio_dumper = create_streaming_audio_dumper(
-                            source="transcribe_streaming",
-                            sample_rate=STREAM_EXPECT_SR,
-                        )
-
                         if full_lang is not None:
                             await ws.send_json({"type": "info", "message": f"language={full_lang}"})
                         continue
@@ -1240,8 +700,6 @@ async def websocket_streaming(
                     return
 
                 raw = msg["bytes"]
-                if stream_audio_dumper is not None:
-                    stream_audio_dumper.write(raw)
                 pcm_i16 = np.frombuffer(raw, dtype=np.int16)
                 if pcm_i16.size == 0:
                     continue
@@ -1268,33 +726,13 @@ async def websocket_streaming(
             await ws.close(code=1011, reason="internal error")
         except Exception:
             pass
-    finally:
-        if stream_audio_dumper is not None:
-            try:
-                stream_audio_dumper.close()
-            except Exception as e:
-                logger.warning("关闭流式音频导出器失败: %s", e)
 
-
+from fastapi import Request
 @app.post("/transcribe-ue")
-async def transcribe_ue(
-    request: Request,
-    vocal_isolation_strength: Optional[float] = Query(
-        None,
-        description="Request-level vocal isolation strength. <= 0 disables it for this request.",
-    ),
-    rms_threshold: Optional[float] = Query(
-        None,
-        description="Request-level RMS threshold. <= 0 disables threshold filtering for this request.",
-    ),
-):
+async def transcribe_ue(request: Request):
     """
     专为 UE Async HTTP Request 设计
-    Body 直接是音频文件原始二进制，language 写死中文。
-    在送入 ASR 前，会对音频做轻量人声分离/语音增强 + 阈值过滤预处理。
-    可通过 query 参数临时覆盖预处理强度：
-      vocal_isolation_strength <= 0  表示关闭人声增强
-      rms_threshold <= 0             表示关闭 RMS 阈值过滤
+    Body 直接是音频文件原始二进制，language 写死中文
     
     UE 端设置：
       URL:    http://192.168.1.169:8001/transcribe-ue
@@ -1310,57 +748,18 @@ async def transcribe_ue(
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Empty body")
 
-    preprocess_config = resolve_ue_preprocess_config(
-        vocal_isolation_strength=vocal_isolation_strength,
-        rms_threshold=rms_threshold,
-    )
-    if vocal_isolation_strength is not None or rms_threshold is not None:
-        logger.info(
-            "UE 请求覆盖预处理参数: vocal_isolation_strength=%s rms_threshold=%s -> vocal_enabled=%s vocal_strength=%.3f threshold_enabled=%s threshold_rms=%.6f",
-            vocal_isolation_strength,
-            rms_threshold,
-            preprocess_config.vocal_isolation_enabled,
-            preprocess_config.vocal_isolation_strength,
-            preprocess_config.threshold_filter_enabled,
-            preprocess_config.threshold_filter_rms,
-        )
-
     try:
-        # 1. 先解码请求体并保存原始导入音频，便于问题排查和听感对比。
-        wav_raw, sr = await to_thread_limited(decode_sem, read_audio_file, file_bytes)
-        await asyncio.to_thread(
-            dump_audio_file,
-            wav_raw,
-            sr,
-            "transcribe_ue_raw",
-            "ue_request",
-            enabled=EXPORT_INPUT_AUDIO,
-        )
-
-        # 2. 再执行 UE 专用预处理链：转单声道 -> 可选人声增强 -> 可选阈值过滤。
-        wav = await to_thread_limited(decode_sem, preprocess_ue_audio_for_asr, wav_raw, sr, preprocess_config)
-        if UE_EXPORT_PREPROCESSED_AUDIO:
-            await asyncio.to_thread(
-                dump_audio_file,
-                wav,
-                sr,
-                "transcribe_ue_preprocessed",
-                "ue_vocal_isolated",
-                enabled=UE_EXPORT_PREPROCESSED_AUDIO,
-            )
+        wav, sr = await to_thread_limited(decode_sem, read_audio_file, file_bytes)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid audio: {e}")
 
     try:
-        # 3. 最后将预处理后的音频送入 ASR 模型。
         async with infer_sem:
             results = await asyncio.to_thread(
                 model.transcribe,
                 audio=[(wav, sr)],
                 language=["Chinese"],   # 写死中文
             )
-        # 保留最近一次预处理结果，方便本地直接试听。
-        sf.write("output.wav", wav, samplerate=sr)
         return {"text": results[0].text, "language": results[0].language}
     except Exception as e:
         logger.exception(f"推理失败: {e}")
