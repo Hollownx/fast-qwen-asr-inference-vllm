@@ -135,7 +135,7 @@ def read_audio_file(file_bytes: bytes) -> Tuple[np.ndarray, int]:   #是输出�
 # 配置
 # =============================================================================
 ASR_BACKEND = os.getenv("ASR_BACKEND", "llm").lower()  # llm | torch_compile | torch_compile_trt | tensorrt
-ASR_MODEL_NAME = os.getenv("ASR_MODEL_NAME", "Qwen/Qwen3-ASR-1.7B")
+ASR_MODEL_NAME = os.getenv("ASR_MODEL_NAME", "Qwen/Qwen3-ASR-0.6B")
 TORCH_DTYPE = os.getenv("TORCH_DTYPE", "float16")  # float16 | bfloat16
 ASR_TENSORRT_ENGINE = os.getenv("ASR_TENSORRT_ENGINE", "qwen3_asr_1.7b.engine")
 

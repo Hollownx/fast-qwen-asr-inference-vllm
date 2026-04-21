@@ -30,12 +30,12 @@
 # -----------------------------
 IMAGE              ?= qwen3-asr-trt:latest
 CONTAINER          ?= qwen3-asr-trt
-PORT               ?= 8908
+PORT               ?= 8001
 
 # -----------------------------
 # 模型配置
 # -----------------------------
-ASR_MODEL_NAME     ?= Qwen/Qwen3-ASR-1.7B
+ASR_MODEL_NAME     ?= Qwen/Qwen3-ASR-0.6B
 
 #HF_HOME            ?= $(PWD)/hf_models
 HF_HOME            ?= /home/ld01/.cache/huggingface/hub
@@ -106,7 +106,7 @@ up:
 	  -e ASR_BACKEND=$(BACKEND) \
 	  -e ASR_MODEL_NAME=$(ASR_MODEL_NAME) \
 	  -e ASR_TENSORRT_ENGINE=/data/shared/Qwen3-ASR/$(ENGINE_FILE) \
-	  -e LISTEN_PORT=8001 \
+	  -e LISTEN_PORT=8001 -e HF_ENDPOINT=https://hf-mirror.com -e HF_HUB_OFFLINE=0 \   
 	  -v $(PWD):/data/shared/Qwen3-ASR \
 	  -v $(HF_HOME):/data/shared/hf_models \
 	  $(IMAGE)
