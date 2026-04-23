@@ -157,21 +157,21 @@ LISTEN_HOST = os.getenv("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.getenv("LISTEN_PORT", "8001"))
 
 # 输入音频导出与 UE 预处理配置  <= 0：关闭该步骤
-EXPORT_INPUT_AUDIO = get_env_bool("EXPORT_INPUT_AUDIO", "false")
+EXPORT_INPUT_AUDIO = get_env_bool("EXPORT_INPUT_AUDIO", "true")
 EXPORT_INPUT_AUDIO_DIR = Path(os.getenv("EXPORT_INPUT_AUDIO_DIR", "exported_audio"))
 # UE 人声增强配置  越大：背景压得越狠，但也更容易把弱语音、尾音、混响一起削掉。
-UE_ENABLE_VOCAL_ISOLATION = get_env_bool("UE_ENABLE_VOCAL_ISOLATION", "false")
+UE_ENABLE_VOCAL_ISOLATION = get_env_bool("UE_ENABLE_VOCAL_ISOLATION", "true")
 UE_EXPORT_PREPROCESSED_AUDIO = get_env_bool(
     "UE_EXPORT_PREPROCESSED_AUDIO",
     "true" if EXPORT_INPUT_AUDIO else "false",
 )
-UE_VOCAL_ISOLATION_STRENGTH = float(os.getenv("UE_VOCAL_ISOLATION_STRENGTH", "1.25"))
+UE_VOCAL_ISOLATION_STRENGTH = float(os.getenv("UE_VOCAL_ISOLATION_STRENGTH", "1.5")) #0.6～3.0
 
 # UE RMS 阈值过滤配置
 UE_ENABLE_THRESHOLD_FILTER = get_env_bool("UE_ENABLE_THRESHOLD_FILTER", "true")
-UE_THRESHOLD_FILTER_RMS = float(os.getenv("UE_THRESHOLD_FILTER_RMS", "0.4")) 
-UE_THRESHOLD_FILTER_FRAME_MS = int(os.getenv("UE_THRESHOLD_FILTER_FRAME_MS", "20"))  #检测窗口时长
-UE_THRESHOLD_FILTER_PAD_MS = int(os.getenv("UE_THRESHOLD_FILTER_PAD_MS", "120")) #音频填充/缓冲时长
+UE_THRESHOLD_FILTER_RMS = float(os.getenv("UE_THRESHOLD_FILTER_RMS", "0.35"))
+UE_THRESHOLD_FILTER_FRAME_MS = int(os.getenv("UE_THRESHOLD_FILTER_FRAME_MS", "50"))  #检测窗口时长
+UE_THRESHOLD_FILTER_PAD_MS = int(os.getenv("UE_THRESHOLD_FILTER_PAD_MS", "500")) #音频填充/缓冲时长
  
 # 并发与线程池配置
 MAX_CONCURRENT_DECODE = int(os.getenv("MAX_CONCURRENT_DECODE", "4"))  # 音频解码并发数
