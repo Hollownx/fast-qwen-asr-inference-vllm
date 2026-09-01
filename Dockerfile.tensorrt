@@ -25,9 +25,10 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install \
         torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 && \
     pip3 install \
-        "qwen-asr" \
+        "qwen-asr==0.0.6" \
         fastapi "uvicorn[standard]" python-multipart \
-        soundfile scipy numpy psutil websockets
+        soundfile scipy numpy psutil websockets \
+        pypinyin
 
 # TensorRT Python 绑定（供 tensorrt 引擎后端使用，可选）
 # llm / torch_compile 后端不需要此包

@@ -56,6 +56,14 @@ ONNX_SIM_FILE      ?= qwen3_asr_1.7b_sim.onnx
 WORKSPACE_GB       ?= 4
 
 # -----------------------------
+# /transcribe 热词纠错
+#   不设置时使用 server_tensorrt.py 内的代码默认值
+#   设置后透传进容器覆盖默认值
+# -----------------------------
+ASR_HOTWORDS       ?=
+ASR_HOTWORD_FIXES  ?=
+
+# -----------------------------
 # 测试 & 基准
 # -----------------------------
 FILES_DIR          ?= files
@@ -109,6 +117,8 @@ up:
 	  -e LISTEN_PORT=8001 \
 	  -e HF_ENDPOINT=https://hf-mirror.com \
 	  -e HF_HUB_OFFLINE=0 \
+	  $(if $(ASR_HOTWORDS),-e ASR_HOTWORDS=$(ASR_HOTWORDS),) \
+	  $(if $(ASR_HOTWORD_FIXES),-e ASR_HOTWORD_FIXES=$(ASR_HOTWORD_FIXES),) \
 	  -v $(PWD):/data/shared/Qwen3-ASR \
 	  -v $(HF_HOME):/data/shared/hf_models \
 	  $(IMAGE)
